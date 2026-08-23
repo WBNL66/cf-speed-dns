@@ -7,31 +7,24 @@ Cloudflare DNS 智能优选 IP
 功能：
 1. 获取当前 Cloudflare DNS A 记录
 2. 获取 ipTop.html 优选 IP
-3. 对当前 IP 和候选 IP 进行真实下载测速
-4. 候选 IP 至少比当前 IP 快 10% 才更换
-5. 没有明显更快的 IP 则保持不变
-6. 当前 IP 测速失败不会更换
-7. 所有情况下都发送 Telegram 通知
-8. DNS 更新时尽量保留原有记录属性
+3. 使用 curl --resolve 进行真实 HTTPS 下载测速
+4. 正确使用 speed.cloudflare.com 的 TLS SNI
+5. 每个 IP 测速 2 次，取中位数
+6. 候选 IP 至少比当前 IP 快 10% 才更换
+7. 当前 IP 测速失败不会误换 IP
+8. 无论换不换 IP 都发送 Telegram 通知
+9. DNS 更新失败会发送 Telegram 通知
+10. 保留 Cloudflare 原有记录属性
 """
 
 import os
 import re
 import time
 import statistics
+import subprocess
 import traceback
 
 import requests
-import urllib3
-
-
-# =========================================================
-# 忽略 verify=False 的 HTTPS 警告
-# =========================================================
-
-urllib3.disable_warnings(
-    urllib3.exceptions.InsecureRequestWarning
-)
 
 
 # =========================================================
@@ -50,38 +43,39 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 # 参数
 # =========================================================
 
-# Cloudflare API / Telegram 默认超时
+# Cloudflare / Telegram API 超时时间
 DEFAULT_TIMEOUT = 20
 
-# 候选 IP 至少比当前 IP 快多少才更换
-# 0.10 = 10%
+# 候选 IP 至少比当前 IP 快 10% 才更换
 MIN_SPEED_IMPROVEMENT = 0.10
 
 # 每个 IP 测速次数
 TEST_ROUNDS = 2
 
-# 每次测速最大下载量
-# 5 MB
+# 每次下载测试 5 MB
 TEST_BYTES = 5 * 1024 * 1024
 
 # 最多测试多少个候选 IP
 MAX_CANDIDATES = 5
 
-# 每次测速失败后的重试次数
+# 单次测速超时时间
+SPEED_TIMEOUT = 20
+
+# 测速失败后的重试次数
 SPEED_RETRIES = 2
 
-# 单次测速超时时间
-SPEED_TIMEOUT = 15
+# Cloudflare 官方测速域名
+SPEED_HOST = "speed.cloudflare.com"
 
 
 # =========================================================
-# Cloudflare 请求头
+# Cloudflare API Headers
 # =========================================================
 
 CF_HEADERS = {
     "Authorization": f"Bearer {CF_API_TOKEN}",
     "Content-Type": "application/json",
-    "User-Agent": "Cloudflare-IP-Optimizer/3.0"
+    "User-Agent": "Cloudflare-IP-Optimizer/4.0"
 }
 
 
@@ -146,7 +140,7 @@ def send_telegram(message):
 
 
 # =========================================================
-# 获取 Cloudflare DNS 记录
+# 获取 Cloudflare DNS
 # =========================================================
 
 def get_dns_records():
@@ -199,10 +193,7 @@ def get_dns_records():
 
         records = []
 
-        for record in result.get(
-            "result",
-            []
-        ):
+        for record in result.get("result", []):
 
             if (
                 record.get("type") == "A"
@@ -230,7 +221,7 @@ def get_dns_records():
 
 def get_candidate_ips():
     """
-    获取 ipTop.html 中的 IPv4 地址
+    从 ipTop.html 提取 IPv4
     """
 
     url = "https://ip.164746.xyz/ipTop.html"
@@ -256,10 +247,7 @@ def get_candidate_ips():
 
             return []
 
-        # =================================================
-        # 提取 IPv4
-        # =================================================
-
+        # IPv4 正则
         ips = re.findall(
             r"\b"
             r"(?:25[0-5]|2[0-4]\d|"
@@ -271,10 +259,7 @@ def get_candidate_ips():
             response.text
         )
 
-        # =================================================
         # 去重
-        # =================================================
-
         unique_ips = []
 
         for ip in ips:
@@ -302,134 +287,228 @@ def get_candidate_ips():
 
 
 # =========================================================
-# 单次真实测速
+# 检查 curl
+# =========================================================
+
+def check_curl():
+    """
+    检查 GitHub Actions 环境是否存在 curl。
+    Ubuntu runner 默认自带 curl。
+    """
+
+    try:
+
+        result = subprocess.run(
+            ["curl", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+
+            print(
+                "curl 检测成功："
+                + result.stdout.splitlines()[0]
+            )
+
+            return True
+
+    except Exception as e:
+
+        print(
+            f"检测 curl 失败：{e}"
+        )
+
+    return False
+
+
+# =========================================================
+# 单次测速
 # =========================================================
 
 def single_speed_test(ip):
     """
-    对 Cloudflare IP 进行真实 HTTPS 下载测速。
+    使用 curl --resolve 测速。
 
-    使用：
+    关键：
 
-        https://IP/__down?bytes=xxxx
+    --resolve speed.cloudflare.com:443:IP
 
-    Host：
+    这样：
 
+    DNS：
+        speed.cloudflare.com -> 指定 IP
+
+    TLS SNI：
         speed.cloudflare.com
 
-    注意：
-    使用 verify=False 是因为这里直接访问 IP，
-    TLS 证书通常与 IP 不匹配。
+    实际连接：
+        指定 IP
+
+    从而避免：
+
+        SSLV3_ALERT_HANDSHAKE_FAILURE
     """
 
     url = (
-        f"https://{ip}/__down"
+        f"https://{SPEED_HOST}/__down"
         f"?bytes={TEST_BYTES}"
     )
 
-    headers = {
-        "Host": "speed.cloudflare.com",
-        "User-Agent":
-            "Mozilla/5.0 "
-            "Cloudflare-IP-Optimizer",
-        "Accept": "*/*",
-        "Connection": "close"
-    }
+    resolve = (
+        f"{SPEED_HOST}:443:{ip}"
+    )
 
-    response = None
+    command = [
+        "curl",
+
+        "--silent",
+        "--show-error",
+
+        "--location",
+
+        "--http1.1",
+
+        "--connect-timeout",
+        "8",
+
+        "--max-time",
+        str(SPEED_TIMEOUT),
+
+        "--resolve",
+        resolve,
+
+        "--output",
+        "/dev/null",
+
+        "--write-out",
+        "%{http_code}|%{speed_download}|%{time_total}",
+
+        url
+    ]
 
     try:
 
-        start_time = time.perf_counter()
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=SPEED_TIMEOUT,
-            verify=False,
-            stream=True
+        print(
+            f"{ip} 开始测速..."
         )
 
-        # =================================================
-        # 检查 HTTP 状态码
-        # =================================================
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=SPEED_TIMEOUT + 5
+        )
 
-        if response.status_code != 200:
+        output = result.stdout.strip()
+
+        error = result.stderr.strip()
+
+        if result.returncode != 0:
 
             print(
-                f"{ip} HTTP 状态码："
-                f"{response.status_code}"
+                f"{ip} curl 失败："
+                f"{error}"
             )
 
             return 0.0
 
         # =================================================
-        # 下载数据
+        # 解析 curl 输出
+        #
+        # HTTP状态码 | 下载速度(bytes/s) | 总时间
         # =================================================
 
-        total_bytes = 0
+        parts = output.split("|")
 
-        for chunk in response.iter_content(
-            chunk_size=64 * 1024
-        ):
+        if len(parts) != 3:
 
-            if not chunk:
+            print(
+                f"{ip} 无法解析测速结果："
+                f"{output}"
+            )
 
-                continue
+            return 0.0
 
-            total_bytes += len(chunk)
+        http_code = parts[0]
 
-            if total_bytes >= TEST_BYTES:
+        speed_bytes = float(
+            parts[1]
+        )
 
-                break
-
-        elapsed = (
-            time.perf_counter()
-            - start_time
+        total_time = float(
+            parts[2]
         )
 
         # =================================================
-        # 判断测速结果
+        # HTTP 状态
         # =================================================
 
-        if (
-            elapsed <= 0
-            or total_bytes <= 0
-        ):
+        if http_code != "200":
+
+            print(
+                f"{ip} HTTP 状态码："
+                f"{http_code}"
+            )
+
+            return 0.0
+
+        # =================================================
+        # 下载速度
+        #
+        # curl:
+        # speed_download = bytes/sec
+        #
+        # 转换：
+        # Mbps = bytes/s × 8 / 1,000,000
+        # =================================================
+
+        if speed_bytes <= 0:
+
+            print(
+                f"{ip} 下载速度为 0"
+            )
 
             return 0.0
 
         speed_mbps = (
-            total_bytes
+            speed_bytes
             * 8
-            / elapsed
             / 1_000_000
         )
 
-        return round(
+        speed_mbps = round(
             speed_mbps,
             2
         )
 
-    except Exception as e:
+        print(
+            f"{ip} 测速成功："
+            f"{speed_mbps} Mbps"
+            f" | {total_time:.2f}s"
+        )
+
+        return speed_mbps
+
+    except subprocess.TimeoutExpired:
 
         print(
-            f"{ip} 单次测速失败：{e}"
+            f"{ip} 测速超时"
         )
 
         return 0.0
 
-    finally:
+    except Exception as e:
 
-        if response is not None:
+        print(
+            f"{ip} 单次测速异常："
+            f"{e}"
+        )
 
-            try:
-
-                response.close()
-
-            except Exception:
-
-                pass
+        return 0.0
 
 
 # =========================================================
@@ -438,21 +517,26 @@ def single_speed_test(ip):
 
 def test_ip_speed(ip):
     """
-    对 IP 进行多次测速。
+    多次测速。
 
     每轮失败会重试。
-    最终使用中位数作为最终速度。
+    最终取成功结果的中位数。
     """
 
     results = []
 
     print(
-        f"\n开始测速：{ip}"
+        "\n"
+        + "-" * 50
     )
 
-    # =====================================================
-    # 多轮测速
-    # =====================================================
+    print(
+        f"开始测速：{ip}"
+    )
+
+    print(
+        "-" * 50
+    )
 
     for round_no in range(
         TEST_ROUNDS
@@ -461,7 +545,7 @@ def test_ip_speed(ip):
         speed = 0.0
 
         # =================================================
-        # 失败重试
+        # 重试
         # =================================================
 
         for retry in range(
@@ -478,7 +562,7 @@ def test_ip_speed(ip):
 
             print(
                 f"{ip} 第 "
-                f"{round_no + 1} 次测速失败，"
+                f"{round_no + 1} 轮测速失败，"
                 f"重试 "
                 f"{retry + 1}/"
                 f"{SPEED_RETRIES}"
@@ -501,10 +585,6 @@ def test_ip_speed(ip):
                 f"{speed} Mbps"
             )
 
-        # =================================================
-        # 失败
-        # =================================================
-
         else:
 
             print(
@@ -526,7 +606,7 @@ def test_ip_speed(ip):
         return 0.0
 
     # =====================================================
-    # 使用中位数
+    # 中位数
     # =====================================================
 
     median_speed = statistics.median(
@@ -539,7 +619,7 @@ def test_ip_speed(ip):
     )
 
     print(
-        f"{ip} 最终测速："
+        f"{ip} 最终速度："
         f"{median_speed} Mbps"
     )
 
@@ -547,7 +627,7 @@ def test_ip_speed(ip):
 
 
 # =========================================================
-# 更新 Cloudflare DNS
+# 更新 DNS
 # =========================================================
 
 def update_dns_record(
@@ -555,13 +635,14 @@ def update_dns_record(
     new_ip
 ):
     """
-    更新 Cloudflare DNS A 记录。
+    更新 Cloudflare DNS。
 
     尽量保留：
-    - TTL
-    - proxied
-    - comment
-    - tags
+
+    TTL
+    proxied
+    comment
+    tags
     """
 
     record_id = record["id"]
@@ -570,10 +651,6 @@ def update_dns_record(
         "content",
         ""
     )
-
-    # =====================================================
-    # IP 相同
-    # =====================================================
 
     if old_ip == new_ip:
 
@@ -588,10 +665,6 @@ def update_dns_record(
         f"zones/{CF_ZONE_ID}/dns_records/"
         f"{record_id}"
     )
-
-    # =====================================================
-    # 保留原记录属性
-    # =====================================================
 
     data = {
         "type": "A",
@@ -614,20 +687,14 @@ def update_dns_record(
         )
     }
 
-    # =====================================================
-    # comment
-    # =====================================================
-
+    # 保留 comment
     if "comment" in record:
 
         data["comment"] = record[
             "comment"
         ]
 
-    # =====================================================
-    # tags
-    # =====================================================
-
+    # 保留 tags
     if "tags" in record:
 
         data["tags"] = record[
@@ -645,10 +712,6 @@ def update_dns_record(
 
         result = response.json()
 
-        # =================================================
-        # 更新成功
-        # =================================================
-
         if (
             response.status_code == 200
             and result.get("success")
@@ -661,10 +724,6 @@ def update_dns_record(
 
             return True
 
-        # =================================================
-        # 更新失败
-        # =================================================
-
         print(
             "DNS 更新失败："
         )
@@ -676,111 +735,13 @@ def update_dns_record(
     except Exception as e:
 
         print(
-            f"DNS 更新异常：{e}"
+            f"DNS 更新异常："
+            f"{e}"
         )
 
         traceback.print_exc()
 
     return False
-
-
-# =========================================================
-# Telegram：测速失败
-# =========================================================
-
-def notify_current_speed_failed(
-    current_ip
-):
-    """
-    当前 IP 测速失败时通知。
-    """
-
-    message = (
-        "⚠️ <b>Cloudflare IP 检测</b>\n\n"
-
-        f"域名："
-        f"<code>{CF_DNS_NAME}</code>\n"
-
-        f"当前 IP："
-        f"<code>{current_ip}</code>\n\n"
-
-        "❌ 当前 IP 测速失败\n"
-
-        "⏸️ 为防止误换 IP，"
-        "本次保持不变。"
-    )
-
-    send_telegram(
-        message
-    )
-
-
-# =========================================================
-# Telegram：没有候选 IP
-# =========================================================
-
-def notify_no_candidates(
-    current_ip,
-    current_speed
-):
-    """
-    没有获取到候选 IP 时通知。
-    """
-
-    message = (
-        "⚠️ <b>Cloudflare IP 检测</b>\n\n"
-
-        f"域名："
-        f"<code>{CF_DNS_NAME}</code>\n"
-
-        f"当前 IP："
-        f"<code>{current_ip}</code>\n"
-
-        f"当前速度："
-        f"<b>{current_speed} Mbps</b>\n\n"
-
-        "❌ 未获取到候选优选 IP\n"
-
-        "⏸️ 保持当前解析。"
-    )
-
-    send_telegram(
-        message
-    )
-
-
-# =========================================================
-# Telegram：所有候选测速失败
-# =========================================================
-
-def notify_all_candidates_failed(
-    current_ip,
-    current_speed
-):
-    """
-    所有候选 IP 测速失败时通知。
-    """
-
-    message = (
-        "⚠️ <b>Cloudflare IP 检测</b>\n\n"
-
-        f"域名："
-        f"<code>{CF_DNS_NAME}</code>\n"
-
-        f"当前 IP："
-        f"<code>{current_ip}</code>\n"
-
-        f"当前速度："
-        f"<b>{current_speed} Mbps</b>\n\n"
-
-        "❌ 所有候选 IP 测速失败\n"
-
-        "⏸️ 保持当前解析。"
-    )
-
-    send_telegram(
-        message
-    )
 
 
 # =========================================================
@@ -795,6 +756,15 @@ def main():
         "Cloudflare DNS 智能优选 IP"
     )
 
+    print(
+        "测速方式：curl --resolve"
+    )
+
+    print(
+        f"更换阈值："
+        f"{MIN_SPEED_IMPROVEMENT * 100:.0f}%"
+    )
+
     print("=" * 60)
 
     # =====================================================
@@ -807,6 +777,11 @@ def main():
             "错误：CF_API_TOKEN 未设置"
         )
 
+        send_telegram(
+            "❌ <b>Cloudflare IP 检测失败</b>\n\n"
+            "CF_API_TOKEN 未设置。"
+        )
+
         return
 
     if not CF_ZONE_ID:
@@ -815,12 +790,35 @@ def main():
             "错误：CF_ZONE_ID 未设置"
         )
 
+        send_telegram(
+            "❌ <b>Cloudflare IP 检测失败</b>\n\n"
+            "CF_ZONE_ID 未设置。"
+        )
+
         return
 
     if not CF_DNS_NAME:
 
         print(
             "错误：CF_DNS_NAME 未设置"
+        )
+
+        send_telegram(
+            "❌ <b>Cloudflare IP 检测失败</b>\n\n"
+            "CF_DNS_NAME 未设置。"
+        )
+
+        return
+
+    # =====================================================
+    # 检查 curl
+    # =====================================================
+
+    if not check_curl():
+
+        send_telegram(
+            "❌ <b>Cloudflare IP 检测失败</b>\n\n"
+            "GitHub Actions 环境中没有找到 curl。"
         )
 
         return
@@ -834,14 +832,15 @@ def main():
     if not records:
 
         print(
-            f"错误：没有找到 "
+            f"没有找到 "
             f"{CF_DNS_NAME} 的 A 记录"
         )
 
         send_telegram(
             "❌ <b>Cloudflare IP 检测失败</b>\n\n"
-            f"域名：<code>{CF_DNS_NAME}</code>\n\n"
-            "无法获取 Cloudflare DNS A 记录。"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n\n"
+            "无法获取 Cloudflare A 记录。"
         )
 
         return
@@ -860,12 +859,13 @@ def main():
     if not current_ip:
 
         print(
-            "错误：当前 DNS IP 为空"
+            "当前 DNS IP 为空"
         )
 
         send_telegram(
             "❌ <b>Cloudflare IP 检测失败</b>\n\n"
-            f"域名：<code>{CF_DNS_NAME}</code>\n\n"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n\n"
             "当前 DNS IP 为空。"
         )
 
@@ -896,16 +896,23 @@ def main():
     if current_speed <= 0:
 
         print(
-            "当前 IP 测速失败。"
+            "\n当前 IP 测速失败。"
         )
 
         print(
             "为防止误换 IP，"
-            "本次不进行更换。"
+            "本次保持不变。"
         )
 
-        notify_current_speed_failed(
-            current_ip
+        send_telegram(
+            "⚠️ <b>Cloudflare IP 检测</b>\n\n"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n"
+            f"当前 IP："
+            f"<code>{current_ip}</code>\n\n"
+            "❌ 当前 IP 测速失败\n"
+            "⏸️ 为防止误换 IP，"
+            "本次保持不变。"
         )
 
         return
@@ -919,13 +926,19 @@ def main():
     if not candidates:
 
         print(
-            "没有获取到候选 IP，"
-            "保持当前 IP。"
+            "没有获取到候选 IP。"
         )
 
-        notify_no_candidates(
-            current_ip,
-            current_speed
+        send_telegram(
+            "⚠️ <b>Cloudflare IP 检测</b>\n\n"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n"
+            f"当前 IP："
+            f"<code>{current_ip}</code>\n"
+            f"当前速度："
+            f"<b>{current_speed} Mbps</b>\n\n"
+            "❌ 没有获取到候选优选 IP\n"
+            "⏸️ 保持当前解析。"
         )
 
         return
@@ -941,41 +954,31 @@ def main():
     ]
 
     # =====================================================
-    # 没有新的候选 IP
+    # 没有新的候选
     # =====================================================
 
     if not candidates:
 
         print(
-            "候选 IP 与当前 IP 相同，"
-            "无需更换。"
-        )
-
-        message = (
-            "ℹ️ <b>Cloudflare IP 检测</b>\n\n"
-
-            f"域名："
-            f"<code>{CF_DNS_NAME}</code>\n"
-
-            f"当前 IP："
-            f"<code>{current_ip}</code>\n"
-
-            f"当前速度："
-            f"<b>{current_speed} Mbps</b>\n\n"
-
-            "没有新的候选 IP。\n"
-
-            "⏸️ 保持当前解析。"
+            "没有新的候选 IP。"
         )
 
         send_telegram(
-            message
+            "ℹ️ <b>Cloudflare IP 检测</b>\n\n"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n"
+            f"当前 IP："
+            f"<code>{current_ip}</code>\n"
+            f"当前速度："
+            f"<b>{current_speed} Mbps</b>\n\n"
+            "没有新的候选 IP。\n"
+            "⏸️ 保持当前解析。"
         )
 
         return
 
     # =====================================================
-    # 测试候选 IP
+    # 测试候选
     # =====================================================
 
     speed_results = []
@@ -1002,19 +1005,25 @@ def main():
     if not speed_results:
 
         print(
-            "所有候选 IP 测速失败，"
-            "保持当前 IP。"
+            "\n所有候选 IP 测速失败。"
         )
 
-        notify_all_candidates_failed(
-            current_ip,
-            current_speed
+        send_telegram(
+            "⚠️ <b>Cloudflare IP 检测</b>\n\n"
+            f"域名："
+            f"<code>{CF_DNS_NAME}</code>\n"
+            f"当前 IP："
+            f"<code>{current_ip}</code>\n"
+            f"当前速度："
+            f"<b>{current_speed} Mbps</b>\n\n"
+            "❌ 所有候选 IP 测速失败\n"
+            "⏸️ 保持当前解析。"
         )
 
         return
 
     # =====================================================
-    # 找最快候选
+    # 按速度排序
     # =====================================================
 
     speed_results.sort(
@@ -1027,7 +1036,7 @@ def main():
     )
 
     # =====================================================
-    # 计算提升比例
+    # 计算速度提升
     # =====================================================
 
     improvement = (
@@ -1040,12 +1049,10 @@ def main():
     )
 
     # =====================================================
-    # 输出结果
+    # 输出最终结果
     # =====================================================
 
-    print(
-        "\n" + "=" * 60
-    )
+    print("\n" + "=" * 60)
 
     print(
         f"当前 IP："
@@ -1073,8 +1080,11 @@ def main():
     )
 
     print(
-        "=" * 60
+        f"更换阈值："
+        f"{MIN_SPEED_IMPROVEMENT * 100:.0f}%"
     )
+
+    print("=" * 60)
 
     # =====================================================
     # 判断是否更换
@@ -1086,13 +1096,16 @@ def main():
     )
 
     # =====================================================
-    # 更快超过 10%
+    # 更换 IP
     # =====================================================
 
     if should_change:
 
         print(
-            "\n发现更快 IP，"
+            "\n发现更快 IP。"
+        )
+
+        print(
             "准备更新 Cloudflare DNS。"
         )
 
@@ -1125,8 +1138,11 @@ def main():
                 f"新速度："
                 f"<b>{best_speed} Mbps</b>\n\n"
 
-                f"📈 提升："
-                f"<b>{improvement_percent}%</b>\n\n"
+                f"📈 速度提升："
+                f"<b>{improvement_percent}%</b>\n"
+
+                f"🎯 更换阈值："
+                f"<b>{MIN_SPEED_IMPROVEMENT * 100:.0f}%</b>\n\n"
 
                 "✅ 已自动更换 IP"
             )
@@ -1149,13 +1165,13 @@ def main():
                 f"当前速度："
                 f"<b>{current_speed} Mbps</b>\n\n"
 
-                f"候选 IP："
+                f"最佳候选："
                 f"<code>{best_ip}</code>\n"
 
                 f"候选速度："
                 f"<b>{best_speed} Mbps</b>\n\n"
 
-                f"📈 理论提升："
+                f"📈 速度提升："
                 f"<b>{improvement_percent}%</b>\n\n"
 
                 "❌ DNS 更新失败\n"
@@ -1163,7 +1179,7 @@ def main():
             )
 
     # =====================================================
-    # 不满足更换条件
+    # 不更换
     # =====================================================
 
     else:
@@ -1177,12 +1193,12 @@ def main():
         else:
 
             reason = (
-                f"虽然候选更快，"
+                f"虽然候选 IP 更快，"
                 f"但只提升 "
                 f"{improvement_percent}%，"
                 f"不足 "
                 f"{MIN_SPEED_IMPROVEMENT * 100:.0f}% "
-                f"更换阈值。"
+                f"的更换阈值。"
             )
 
         message = (
@@ -1204,7 +1220,10 @@ def main():
             f"<b>{best_speed} Mbps</b>\n\n"
 
             f"📊 速度差："
-            f"<b>{improvement_percent}%</b>\n\n"
+            f"<b>{improvement_percent}%</b>\n"
+
+            f"🎯 更换阈值："
+            f"<b>{MIN_SPEED_IMPROVEMENT * 100:.0f}%</b>\n\n"
 
             f"📌 {reason}\n\n"
 
@@ -1212,7 +1231,7 @@ def main():
         )
 
     # =====================================================
-    # Telegram
+    # TG 推送
     # =====================================================
 
     send_telegram(
