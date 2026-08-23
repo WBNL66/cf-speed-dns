@@ -5,10 +5,7 @@ env:
 
 on:
   schedule:
-    # 每 1 小时执行一次
     - cron: '0 * * * *'
-
-  # 支持手动执行
   workflow_dispatch:
 
 jobs:
@@ -16,45 +13,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # ==============================
-      # 拉取代码
-      # ==============================
-      - name: 'Checkout'
+      - name: Checkout
         uses: actions/checkout@v5
 
-
-      # ==============================
-      # 安装 Python
-      # ==============================
-      - name: 'Set up Python'
+      - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-
-      # ==============================
-      # 安装依赖
-      # ==============================
-      - name: 'Install dependencies'
+      - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
 
-
-      # ==============================
-      # 执行 Cloudflare IP 智能优选
-      # ==============================
-      - name: 'Run dnscf'
+      - name: Run dnscf
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_DNS_NAME: ${{ secrets.CF_DNS_NAME }}
-
-          # Telegram
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
-        run: |
-          python dnscf.py
+        run: python dnscf.py
