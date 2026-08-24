@@ -1,0 +1,9 @@
+{
+  "current_ip": "",
+  "speed": 0,
+  "latency": 0,
+  "packet_loss": 0,
+  "time": "",
+  "top5": [],
+  "previous_top5": []
+}
