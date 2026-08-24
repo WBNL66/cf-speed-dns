@@ -5,9 +5,9 @@ env:
 
 on:
   schedule:
-    # 北京时间（UTC+8）
-    # 00:00 / 09:00 / 12:00 / 17:00 / 21:00 / 22:00 / 23:00
-    - cron: '0 1,4,9,13,14,15,16 * * *'
+    # 每 30 分钟执行一次
+    # GitHub Actions 默认使用 UTC
+    - cron: '*/30 * * * *'
 
   workflow_dispatch:
 
